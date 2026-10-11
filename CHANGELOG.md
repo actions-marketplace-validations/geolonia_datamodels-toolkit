@@ -4,6 +4,10 @@ All notable changes to `@geolonia/datamodels`. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- An agent skill, `skills/datamodels/SKILL.md`: the catalog's modelling rules and the toolkit's workflow, pointing to datamodels.jp's `llms.txt` for the models.
+
 ### Changed
 
 - The footer's first line is one short line, so it fits on desktop screens: the publisher, the licence, `catalog.json` and `llms.txt`, separated by dots.
