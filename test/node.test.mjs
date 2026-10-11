@@ -38,6 +38,21 @@ async function node({ yaml = NODE_YAML, context } = {}) {
   return dir;
 }
 
+test('the namespace page groups the terms by the model that first defines them', async () => {
+  const dir = await node({ context: { road: `${BASE}/ns/road#`, RoadPatrol: 'road:RoadPatrol', RoadSign: 'road:RoadSign', route: 'road:route', sign: 'road:sign' } });
+  const sign = join(dir, 'models', 'road', 'RoadSign');
+  await mkdir(sign, { recursive: true });
+  await writeFile(join(sign, 'schema.json'), JSON.stringify({ $id: `${BASE}/schema/road/RoadSign/v0.1.0.json`, type: 'object', properties: { id: {}, type: {}, sign: { type: 'string', 'x-iri': `${BASE}/ns/road#sign` }, route: { type: 'string', 'x-iri': `${BASE}/ns/road#route` } } }));
+  await writeFile(join(sign, 'catalog.yaml'), 'title: { en: Road sign }\ndescription: { en: One sign. }\nstatus: experimental\nattributes:\n  sign: { en: The text on the sign }\n  route: { en: The route the sign is on }\n');
+  await buildNode(dir);
+  const page = await readFile(join(dir, '_site', 'ns', 'road.html'), 'utf8');
+  const groups = Object.fromEntries(page.split('<h3>').slice(1).map((g) => [g.match(/">(\w+)<\/a><\/h3>/)[1], g.slice(0, g.indexOf('</table>'))]));
+  assert.deepEqual(Object.keys(groups), ['RoadPatrol', 'RoadSign']);
+  const ids = (g) => [...g.matchAll(/<tr id="(\w+)">/g)].map((m) => m[1]);
+  assert.deepEqual(ids(groups.RoadPatrol), ['RoadPatrol', 'route']);
+  assert.deepEqual(ids(groups.RoadSign), ['RoadSign', 'sign'], 'route is listed once, under the model that defines it first');
+});
+
 test('a node builds with hash IRIs, its publisher, licence and known nodes', async () => {
   const dir = await node();
   const { catalog, redirects, exactPaths } = await buildNode(dir, { now: new Date('2026-10-10T00:00:00Z') });
@@ -87,6 +102,12 @@ test('the pages: plain HTML, an anchor for every term IRI, a link to catalog.jso
   }
   assert.match(subject, /<link rel="alternate" type="application\/ld\+json" href="https:\/\/models\.example\.org\/vocab\/road\/v0\.1\.0\.jsonld">/);
   assert.doesNotMatch(subject, /hreflang|<nav>/, 'one language: no links to other languages');
+  // Compact: grouped by model, one table row per term, the IRI rule stated once.
+  assert.match(subject, /<h3><a href="https:\/\/models\.example\.org\/models\/road\/RoadPatrol\/">RoadPatrol<\/a><\/h3>\n<table>/);
+  assert.match(subject, /<tr id="route"><th scope="row"><a href="https:\/\/models\.example\.org\/models\/road\/RoadPatrol\/#route">route<\/a><\/th>/);
+  assert.match(subject, /<tr id="RoadPatrol"><th scope="row">.*?<\/th><td><span lang="en">One patrol run\.<\/span><\/td><\/tr>/, 'a type row shows the description');
+  assert.match(subject, /for example https:\/\/models\.example\.org\/ns\/road#RoadPatrol\./);
+  assert.doesNotMatch(subject, /IRI: https/, 'no full IRI repeated per term');
   assert.match(subject, /Road &lt;b&gt;maintenance&lt;\/b&gt;\./, 'text is escaped');
   const model = await read('models/road/RoadPatrol/index.html');
   assert.match(model, /<h3 id="route">route<\/h3>/);
@@ -100,6 +121,12 @@ test('the pages: plain HTML, an anchor for every term IRI, a link to catalog.jso
   await buildNode(dir);
   const renamed = await read('ns/road.html');
   assert.ok(renamed.includes('id="lane"') && !renamed.includes('id="route"'), 'the anchor of route is lane');
+  // An alias mints no terms: no Terms section and no empty example.
+  await writeFile(sf, JSON.stringify({ ...sj, 'x-alias-of': 'https://datamodels.jp/ns/task/Task', properties: Object.fromEntries(Object.entries(sj.properties).map(([k, v]) => [k, v['x-iri'] ? { ...v, 'x-iri': `https://datamodels.jp/ns/task#${k}` } : v])) }));
+  await buildNode(dir);
+  const aliasOnly = await read('ns/road.html');
+  assert.doesNotMatch(aliasOnly, /<h2>Terms<\/h2>|for example \./);
+  await writeFile(sf, JSON.stringify(sj));
   // Only http(s) URLs from the sources become links.
   const schemaFile = join(dir, 'models', 'road', 'RoadPatrol', 'schema.json');
   await writeFile(schemaFile, JSON.stringify({ ...JSON.parse(await readFile(schemaFile, 'utf8')), 'x-subclass-of': 'javascript:alert(1)' }));
