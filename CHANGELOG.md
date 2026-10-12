@@ -4,8 +4,14 @@ All notable changes to `@geolonia/datamodels`. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `@geolonia/datamodels` is on npmjs.org (#74), from 0.3.8. A published GitHub release now stages the package on npmjs.org, through a workflow with npm's [trusted publishing](https://docs.npmjs.com/trusted-publishers): no npm token is stored, and npm adds provenance. A maintainer then approves the staged release with 2FA ([staged publishing](https://docs.npmjs.com/staged-publishing)); only then is it public.
+
 ### Changed
 
+- The README, the agent skill and the README that `datamodels init` writes run the toolkit from npm: `npx @geolonia/datamodels@0.3.8 …` instead of `npx github:geolonia/datamodels-toolkit#v0.3.8 …`.
+- `datamodels upgrade` writes the npm form in a node's Markdown files, also where they ran the toolkit from GitHub. A release from before 0.3.8, which is not on npm, keeps the GitHub form.
 - Japanese texts of the pages, the adapters and the instructions `datamodels mapping` writes use datamodels.jp's term list (geolonia/datamodels#251): 分野 for subject, 検証 for checking data against a schema.
 - `datamodels init` writes a workflow pinned to the v0.3.8 release of the Action, and a README whose `npx` commands run v0.3.8.
 
