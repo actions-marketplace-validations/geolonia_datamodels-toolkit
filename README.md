@@ -138,6 +138,8 @@ await publishCatalog(subjects, { urls, outDir: 'dist', languages: ['en'], head: 
 
 It also exports the NGSI-LD core context that the build uses (`CORE_CONTEXT`, `CORE_CONTEXT_URL`), and `contextTerms`, which lists the terms of a context.
 
+`@geolonia/datamodels/ngsi` converts entities between the normalized form and key-values (`toNormalized`, `toKeyValues`). It has no Node.js imports, so it also runs in a browser.
+
 
 ## Agent skill
 
