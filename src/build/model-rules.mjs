@@ -6,6 +6,7 @@
 // an explicit x-ngsi.type where a node may leave Property out) stay there.
 import { attributesOf } from './urls.mjs';
 import { LANGUAGE_TAG } from './node.mjs';
+import { toKeyValues } from '../ngsi.mjs';
 
 const STATUSES = ['draft', 'experimental', 'stable', 'deprecated'];
 
@@ -171,6 +172,71 @@ export function modelRuleProblems(subjects, { urls, languages }) {
       list.forEach((n, i) => { const p = textsProblem(n, languages); if (p) out.push(`${nf}: ${key}[${i}] ${p} (quote a text that contains ": " or a comma)`); });
     }
     if (m.notes.license !== undefined && typeof m.notes.license !== 'string') out.push(`${nf}: license must be a string`);
+  }
+  return out;
+}
+
+// The id of an example entity: urn:ngsi-ld:<Type>:<local id>, the form the
+// catalog's examples and `datamodels add` use, so a reference shows its type.
+const EXAMPLE_ID = /^urn:ngsi-ld:([A-Za-z_][A-Za-z0-9_-]*):[A-Za-z0-9][A-Za-z0-9._-]*(:[A-Za-z0-9][A-Za-z0-9._-]*)*$/;
+
+/**
+ * The examples of the entity models: the id names the model's type, and a
+ * Relationship references an entity of the type its schema declares
+ * (x-ngsi.target), the example of that type when the node has one.
+ */
+export function exampleRefProblems(subjects, { urls }) {
+  const out = [];
+  const exampleIdOf = new Map();
+  // Type names per type IRI: an alias shares the IRI of its type.
+  const typeNamesOfIri = new Map();
+  for (const s of subjects) for (const m of s.models) {
+    if (m.kind !== 'entity') continue;
+    // Two subjects with a model of the same name: a reference to that name names neither example.
+    const id = m.examples?.['example.json']?.id;
+    exampleIdOf.set(m.type, exampleIdOf.has(m.type) ? null : typeof id === 'string' ? id : null);
+    const iri = urls.modelUrls(s, m).typeIri;
+    typeNamesOfIri.set(iri, [...(typeNamesOfIri.get(iri) ?? []), m.type]);
+  }
+  for (const s of subjects) for (const m of s.models) {
+    if (m.kind !== 'entity') continue;
+    const dir = `${s.name}/${m.type}/examples`;
+    const attrs = attributesOf(m);
+    // The targets of each Relationship of an entity in key-values form.
+    const refsOf = (entity) => Object.fromEntries(attrs.filter(([name, prop]) => prop?.['x-ngsi']?.type === 'Relationship' && entity[name] !== undefined).map(([name]) => [name, [entity[name]].flat()]));
+    const checkRefs = (refs, file) => {
+      for (const [name, targets] of Object.entries(refs)) {
+        // A target of another site, or none ("any"), fixes no type here.
+        const declared = typeNamesOfIri.get(m.schema.properties[name]['x-ngsi'].target);
+        for (const target of targets) {
+          const targetType = EXAMPLE_ID.exec(typeof target === 'string' ? target : '')?.[1];
+          if (!targetType) { out.push(`${dir}/${file}: ${name}: ${JSON.stringify(target)} is not urn:ngsi-ld:<Type>:<local id>`); continue; }
+          if (declared && !declared.includes(targetType)) { out.push(`${dir}/${file}: ${name}: ${target} is a ${targetType}, but schema.json declares a ${declared.join(' or ')} target`); continue; }
+          const expected = targetType !== m.type ? exampleIdOf.get(targetType) : undefined;
+          if (expected && target !== expected) out.push(`${dir}/${file}: ${name}: ${target} should reference the ${targetType} example, ${expected}`);
+        }
+      }
+    };
+    const kv = m.examples?.['example.json'];
+    let kvRefs;
+    if (isObject(kv)) {
+      if (EXAMPLE_ID.exec(typeof kv.id === 'string' ? kv.id : '')?.[1] !== m.type) out.push(`${dir}/example.json: id must be urn:ngsi-ld:${m.type}:<local id>, got ${JSON.stringify(kv.id)}`);
+      kvRefs = refsOf(kv);
+      checkRefs(kvRefs, 'example.json');
+    }
+    // The normalized example, through its key-values projection; one that cannot be projected is reported by the example check.
+    const norm = m.examples?.['example-normalized.jsonld'];
+    if (!isObject(norm)) continue;
+    let projected;
+    try { projected = toKeyValues(norm, { multi: new Set(attrs.filter(([, p]) => p?.['x-ngsi']?.multi).map(([n]) => n)) }); } catch { continue; }
+    const normRefs = refsOf(projected);
+    if (!kvRefs) { checkRefs(normRefs, 'example-normalized.jsonld'); continue; }
+    // Both examples describe the same entity, so they reference the same targets (example.json is checked above).
+    for (const name of new Set([...Object.keys(kvRefs), ...Object.keys(normRefs)])) {
+      const a = kvRefs[name] ?? [];
+      const b = normRefs[name] ?? [];
+      if (!sameSet(a.map(String), b.map(String))) out.push(`${dir}/example-normalized.jsonld: ${name}: references ${b.join(', ') || 'nothing'}, but example.json references ${a.join(', ') || 'nothing'}`);
+    }
   }
   return out;
 }
