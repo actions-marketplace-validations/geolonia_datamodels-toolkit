@@ -19,6 +19,7 @@ import { catalogUrls, attributesOf } from './urls.mjs';
 import { schemaRuleProblems, exampleProblems, contextLoader, jsonldProblems, vocabularyProblems } from './examples.mjs';
 import { mappingFileProblems, viaCycles } from './mapping-check.mjs';
 import { compareWithBase } from './published.mjs';
+import { getter, normalUrl } from '../adapters/index.mjs';
 import { verifyRelease } from './releases.mjs';
 
 // A schema on another site that could not be read: noted and skipped, never a problem of this node.
@@ -58,6 +59,29 @@ export function contextTerms(context, inherited = {}) {
 const FULL_IRI = /^(https?|urn):/;
 
 /**
+ * A read that failed, in a few words: the getter's message when it already says
+ * that the URL could not be read; otherwise the URL, with the error's code when it
+ * has one (ENOTFOUND) or its message, without the URL when it starts with it.
+ */
+const unread = (url, e) => {
+  const msg = String(e?.message);
+  if ([`${url} could not be read`, `${url} is not read`].some((s) => msg.startsWith(s))) return msg;
+  return `${url} could not be read (${typeof e?.cause?.code === 'string' ? e.cause.code : msg.startsWith(`${url}: `) ? msg.slice(url.length + 2) : msg})`;
+};
+
+/** The absolute $refs in a schema, without their #fragment and as requested (normalUrl): the schemas it reads from other sites. */
+function absoluteRefs(schema, out = new Set()) {
+  if (Array.isArray(schema)) for (const x of schema) absoluteRefs(x, out);
+  else if (schema && typeof schema === 'object') {
+    for (const [k, v] of Object.entries(schema)) {
+      if (k === '$ref' && typeof v === 'string' && /^[a-z][a-z0-9+.-]*:/i.test(v)) out.add(normalUrl(v.split('#')[0]));
+      else absoluteRefs(v, out);
+    }
+  }
+  return out;
+}
+
+/**
  * Resolve an @context as a JSON-LD processor does: its parts in order, each
  * against the definitions so far. An inline object adds or replaces terms
  * (a term mapped to null is removed), null clears everything before it, and
@@ -67,6 +91,10 @@ const FULL_IRI = /^(https?|urn):/;
  *
  * `local(url)` gives this node's own documents (from its build), offline
  * too: the parsed document, or undefined for a URL of another site.
+ * `written`: the context is this node's own, so an import whose URL as written
+ * may not be read (error.refused 'url', from the adapters' getter) is an error,
+ * not a note. This holds for imports in this node's own files only, not for
+ * those in a context read from another node.
  *
  * An import that cannot be read (or is not read: `offline`) leaves the
  * outcome open: what came before may be overridden, and any term may come
@@ -77,10 +105,10 @@ const FULL_IRI = /^(https?|urn):/;
  * unknown, whether an unread import may define terms not seen, and what
  * could not be read.
  */
-export async function resolveContext(context, getJson, { offline = false, local = async () => undefined } = {}) {
+export async function resolveContext(context, getJson, { offline = false, local = async () => undefined, written = false } = {}) {
   const state = { iris: new Map(), uncertain: new Set(), open: false, notes: [] };
   const docs = new Map();
-  const walk = async (ctx, stack) => {
+  const walk = async (ctx, stack, mine) => {
     for (const part of [ctx].flat()) {
       if (part === null) { state.iris.clear(); state.uncertain.clear(); state.open = false; continue; }
       if (typeof part === 'object') {
@@ -105,7 +133,7 @@ export async function resolveContext(context, getJson, { offline = false, local 
       if (own !== undefined) {
         theirs = own?.['@context'];
         if (theirs === undefined) throw new Error(`${part} has no @context`);
-        await walk(theirs, [...stack, part]);
+        await walk(theirs, [...stack, part], mine);
         continue;
       }
       if (!offline) {
@@ -113,7 +141,11 @@ export async function resolveContext(context, getJson, { offline = false, local 
           if (!docs.has(part)) docs.set(part, getJson(part));
           theirs = (await docs.get(part))?.['@context'];
           if (theirs === undefined) throw new Error('no @context');
-        } catch (e) { state.notes.push(`${part} could not be read (${e.cause?.code ?? e.message})`); theirs = undefined; }
+        } catch (e) {
+          // The URL as this node wrote it (in its own files) may not be read (not https, a private address): an error for the caller.
+          if (mine && e.refused === 'url') throw e;
+          state.notes.push(unread(part, e)); theirs = undefined;
+        }
       }
       if (theirs === undefined) {
         // Anything before may be overridden, and any term may come from it.
@@ -121,10 +153,11 @@ export async function resolveContext(context, getJson, { offline = false, local 
         state.open = true;
         continue;
       }
-      await walk(theirs, [...stack, part]);
+      // Another node's context: what it imports, this node did not write.
+      await walk(theirs, [...stack, part], false);
     }
   };
-  await walk(context, []);
+  await walk(context, [], written);
   return state;
 }
 
@@ -174,7 +207,7 @@ export function termProblems(subject, urls, resolved) {
  * (the published files, the models it extends, schemas on other sites);
  * `base` a git ref to compare the release snapshots with (published.mjs);
  * `allReleased` requires a release snapshot of every subject's current
- * version; `fetch` for tests; `timeout` per request in ms. Returns
+ * version; `fetch` for tests; `timeout` in ms for each URL read, its redirects included. Returns
  * { problems, notes }: any problem fails the check.
  */
 export async function checkNode(dir, { offline = false, base, allReleased = false, fetch: fetchUrl = globalThis.fetch, timeout = 20000 } = {}) {
@@ -222,11 +255,14 @@ export async function checkNode(dir, { offline = false, base, allReleased = fals
     const released = async (s) => stat(join(s.dir, 'releases', `v${s.version}`)).then(() => true, () => false);
     if (allReleased) for (const s of subjects) if (!(await released(s))) problems.push(`${s.name} v${s.version} has no release snapshot: run datamodels release ${s.name} (check --all-released)`);
     const urls = catalogUrls(node.baseUrl, { iris: node.iris });
-    const getJson = async (url) => {
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`${url}: HTTP ${res.status}`);
-      return res.json();
-    };
+    // Other nodes' files (indexes, @contexts, schemas) through the adapters' getter: https on a
+    // public host name only, every redirect checked again. A URL that this node wrote (node.yaml,
+    // catalog.yaml, its schemas and contexts) and that may not be read as written is a problem
+    // (error.refused 'url'). Anything else is a note, as for a node that is down: a redirect or
+    // a DNS answer that is refused, and URLs that come from other nodes' files.
+    const getJson = getter(fetchUrl, timeout);
+    // The schemas this node's own schemas name by URL.
+    const ownRefs = new Set(subjects.flatMap((s) => s.models.flatMap((m) => [...absoluteRefs(m.schema)])));
 
     // A file of this node is read from the build, offline too: what it is about to publish, not what is online.
     const local = async (url) => {
@@ -240,7 +276,10 @@ export async function checkNode(dir, { offline = false, base, allReleased = fals
     const ajv = new Ajv2020({ allErrors: true, strict: false, ownProperties: true, loadSchema: async (uri) => {
       if (uri.startsWith(`${urls.baseUrl}/`)) return JSON.parse(await readFile(join(out, uri.slice(urls.baseUrl.length + 1)), 'utf8'));
       if (offline) throw new Unavailable(`${uri} is on another site, not read with --offline`);
-      try { return await getJson(uri); } catch (e) { throw new Unavailable(`${uri} could not be read (${e.cause?.code ?? e.message})`); }
+      try { return await getJson(uri); } catch (e) {
+        if (e.refused === 'url' && ownRefs.has(normalUrl(uri))) throw new Error(e.message);
+        throw new Unavailable(unread(uri, e));
+      }
     } });
     addFormats(ajv);
     for (const s of subjects) for (const m of s.models) {
@@ -270,7 +309,7 @@ export async function checkNode(dir, { offline = false, base, allReleased = fals
     const resolvedBySubject = new Map();
     for (const s of subjects) {
       let resolved;
-      try { resolved = await resolveContext(s.context['@context'], getJson, { offline, local }); } catch (e) { problems.push(`${s.name}/context.jsonld: ${e.message}`); continue; }
+      try { resolved = await resolveContext(s.context['@context'], getJson, { offline, local, written: true }); } catch (e) { problems.push(`${s.name}/context.jsonld: ${e.message}`); continue; }
       resolvedBySubject.set(s.name, resolved);
       notes.push(...resolved.notes.map((n) => `${s.name}/context.jsonld: ${n}`));
       const found = termProblems(s, urls, resolved);
@@ -333,9 +372,12 @@ export async function checkNode(dir, { offline = false, base, allReleased = fals
     for (const s of subjects) {
       for (const m of s.models) for (const ext of m.catalog?.extends ?? []) {
         const where = `${s.name}/${m.type}: extends ${ext.typeIri} v${ext.version}`;
+        // The index is written in this node's catalog.yaml; what it lists comes from the other node.
+        let ownUrl = true;
         try {
           if (!indexes.has(ext.index)) indexes.set(ext.index, getJson(ext.index));
           const index = await indexes.get(ext.index);
+          ownUrl = false;
           const entry = (index.models ?? []).find((e) => e.typeIri === ext.typeIri);
           if (!entry) { problems.push(`${where}: not listed in ${ext.index}`); continue; }
           // An index lists the current version; an older one is at the same path with its own version (docs/node.md, section 1).
@@ -358,7 +400,8 @@ export async function checkNode(dir, { offline = false, base, allReleased = fals
             if (theirs.has(term) && theirs.get(term) !== iri) problems.push(`${where}: redefines ${term} (${theirs.get(term)} there, ${iri} here)`);
           }
         } catch (e) {
-          notes.push(`${where}: not checked, ${e.cause?.code ?? e.message}`);
+          if (ownUrl && e.refused === 'url') problems.push(`${where}: ${e.message}`);
+          else notes.push(`${where}: not checked, ${e.refused ? e.message : typeof e.cause?.code === 'string' ? e.cause.code : e.message}`);
         }
       }
     }

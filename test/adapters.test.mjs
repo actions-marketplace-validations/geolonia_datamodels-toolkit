@@ -278,6 +278,136 @@ test('export: a type IRI of the local node is its own model, not read from anoth
   assert.equal(r.typeIri, 'https://models.example.org/ns/road#RoadPatrol');
 });
 
+// A model of another node by its type IRI, without --index (geolonia/datamodels#222):
+// the index of the node that minted the IRI first, then the usual one.
+const OTHER = 'https://models.example.net/geo';
+const OTHER_INDEX = `${OTHER}/catalog.json`;
+const HASH_IRI = `${OTHER}/ns/disaster#EvacuationSite`;
+const DJ_INDEX = `${DJ}/catalog.json`;
+const siteCatalog = JSON.parse(await readFile(join(SITE_DIR, 'catalog.json'), 'utf8'));
+/** The fixture catalog as another node under OTHER, with a hash IRI for EvacuationSite. */
+const otherCatalog = JSON.parse(JSON.stringify(siteCatalog).replaceAll(DJ, OTHER));
+otherCatalog.models.find((m) => m.type === 'EvacuationSite').typeIri = HASH_IRI;
+/** datamodels.jp's catalog with one more entry for the other node's type, such as an alias. */
+const djListing = (more) => ({ ...siteCatalog, models: [...siteCatalog.models, { ...siteCatalog.models.find((m) => m.type === 'EvacuationSite'), typeIri: HASH_IRI, ...more }] });
+/** fetch for both nodes: `catalogs` by URL (null: not found), the schemas from the fixture; every URL read goes into `seen`. */
+const twoNodes = (catalogs, seen) => async (url) => {
+  seen.push(String(url));
+  if (url in catalogs) return catalogs[url] ? { ok: true, status: 200, json: async () => structuredClone(catalogs[url]) } : { ok: false, status: 404 };
+  if (!String(url).startsWith(`${OTHER}/`)) return siteFetch(url);
+  try {
+    const text = (await readFile(join(SITE_DIR, String(url).slice(OTHER.length)), 'utf8')).replaceAll(DJ, OTHER);
+    return { ok: true, status: 200, json: async () => JSON.parse(text) };
+  } catch { return { ok: false, status: 404 }; }
+};
+const noNode = await mkdtemp(join(tmpdir(), 'datamodels-no-node-'));
+
+test('export by type IRI: the usual index when the IRI\'s own index cannot be read or does not list it', async () => {
+  // Not readable: the usual index, and its error says what was tried first.
+  let seen = [];
+  await assert.rejects(exportModel(HASH_IRI, ['csv'], { dir: noNode, fetch: twoNodes({ [OTHER_INDEX]: null }, seen) }),
+    { message: `${HASH_IRI} is not a model in ${DJ_INDEX} (tried first: ${OTHER_INDEX}: HTTP 404)` });
+  assert.deepEqual(seen, [OTHER_INDEX, DJ_INDEX]);
+  // Readable but without the IRI: the usual index, which lists it here.
+  seen = [];
+  const withoutIt = { ...otherCatalog, models: otherCatalog.models.filter((m) => m.typeIri !== HASH_IRI) };
+  const r = await exportModel(HASH_IRI, ['csv'], { dir: noNode, fetch: twoNodes({ [OTHER_INDEX]: withoutIt, [DJ_INDEX]: djListing({}) }, seen) });
+  assert.equal(r.from, DJ_INDEX);
+  assert.deepEqual(seen.slice(0, 2), [OTHER_INDEX, DJ_INDEX]);
+  // Not https, or no /ns/: nothing is derived, only the usual index is read.
+  for (const iri of [HASH_IRI.replace('https:', 'http:'), `${OTHER}/vocab/disaster#EvacuationSite`]) {
+    seen = [];
+    await assert.rejects(exportModel(iri, ['csv'], { dir: noNode, fetch: twoNodes({ [OTHER_INDEX]: otherCatalog }, seen) }), { message: `${iri} is not a model in ${DJ_INDEX}` });
+    assert.deepEqual(seen, [DJ_INDEX], iri);
+  }
+});
+
+test('export by type IRI: the index of the node that minted it, read once, before datamodels.jp', async () => {
+  const seen = [];
+  // datamodels.jp also lists the type (as an alias): the node that minted it is used.
+  const r = await exportModel(HASH_IRI, ['csv'], { dir: noNode, fetch: twoNodes({ [OTHER_INDEX]: otherCatalog, [DJ_INDEX]: djListing({ aliasOf: HASH_IRI }) }, seen) });
+  assert.equal(r.from, OTHER_INDEX);
+  assert.equal(r.typeIri, HASH_IRI);
+  assert.equal(r.files[0].content, file(evacuationSite, 'csv'));
+  assert.equal(seen.filter((u) => u === OTHER_INDEX).length, 1);
+  assert.ok(!seen.includes(DJ_INDEX));
+  assert.ok(seen.slice(1).every((u) => u.startsWith(`${OTHER}/schema/`)), seen.join(' '));
+});
+
+test('export by type IRI with --index: that index only, nothing derived', async () => {
+  const seen = [];
+  const r = await exportModel(HASH_IRI, ['csv'], { dir: noNode, index: DJ_INDEX, fetch: twoNodes({ [OTHER_INDEX]: otherCatalog, [DJ_INDEX]: djListing({}) }, seen) });
+  assert.equal(r.from, DJ_INDEX);
+  assert.ok(!seen.includes(OTHER_INDEX));
+  // A datamodels.jp IRI: its own index is the usual one, read once.
+  const again = [];
+  const dj = await exportModel(`${DJ}/ns/disaster/EvacuationSite`, ['csv'], { dir: noNode, fetch: twoNodes({}, again) });
+  assert.equal(dj.from, DJ_INDEX);
+  assert.equal(again.filter((u) => u === DJ_INDEX).length, 1);
+});
+
+test('export by type IRI: the usual index when the IRI\'s own index lists it without a plain type, version or schema', async () => {
+  for (const bad of [{ schemaUrl: undefined }, { version: '1.0.0\nfoo: bar' }, { type: '../x' }]) {
+    const seen = [];
+    const own = structuredClone(otherCatalog);
+    Object.assign(own.models.find((m) => m.typeIri === HASH_IRI), bad);
+    const r = await exportModel(HASH_IRI, ['csv'], { dir: noNode, fetch: twoNodes({ [OTHER_INDEX]: own, [DJ_INDEX]: djListing({}) }, seen) });
+    assert.equal(r.from, DJ_INDEX, JSON.stringify(bad));
+    assert.deepEqual(seen.slice(0, 2), [OTHER_INDEX, DJ_INDEX]);
+    // With --index, the same entry is refused.
+    if ('schemaUrl' in bad) continue;
+    await assert.rejects(exportModel(HASH_IRI, ['csv'], { dir: noNode, index: OTHER_INDEX, fetch: twoNodes({ [OTHER_INDEX]: own }, []) }), /has no usable type name \(UpperCamelCase\) and version \(x\.y\.z\)/);
+  }
+});
+
+test('export by type IRI: a host that does not answer holds up the usual index only for the short wait', async () => {
+  const seen = [];
+  const answering = twoNodes({ [DJ_INDEX]: djListing({}) }, seen);
+  const silent = (url, o) => (url.startsWith(OTHER) ? new Promise((_, reject) => o.signal.addEventListener('abort', () => reject(o.signal.reason))) : answering(url, o));
+  const started = Date.now();
+  const r = await exportModel(HASH_IRI, ['csv'], { dir: noNode, fetch: silent, timeout: 20000, guessTimeout: 100 });
+  assert.equal(r.from, DJ_INDEX);
+  assert.ok(Date.now() - started < 2000, `${Date.now() - started} ms`);
+});
+
+test('the time limit of a read covers its redirects', async () => {
+  const { getter } = await import('../src/adapters/index.mjs');
+  // Each hop answers after 40 ms with a redirect to the next one; the limit is 100 ms for the whole read.
+  const hops = [];
+  const slow = (url, { signal }) => new Promise((resolve, reject) => {
+    hops.push(url);
+    const t = setTimeout(() => resolve(new Response(null, { status: 302, headers: { location: `https://w3id.org/hop/${hops.length}` } })), 40);
+    signal.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason); });
+  });
+  const started = Date.now();
+  await assert.rejects(getter(slow, 100)('https://w3id.org/hop/0'), /could not be read/);
+  assert.ok(Date.now() - started < 200, `${Date.now() - started} ms`);
+  assert.ok(hops.length <= 3, hops.join(' '));
+});
+
+test('a read that is refused says why; one that takes too long says so in words', async () => {
+  const { getter } = await import('../src/adapters/index.mjs');
+  const { publicFetch } = await import('../src/adapters/net.mjs');
+  const dns = (address) => (url, o) => publicFetch(url, { ...o, lookup: (host, opts, callback) => (address ? callback(null, [{ address, family: 4 }]) : undefined) });
+  const reason = (p) => p.then(() => null, (e) => [e.refused ?? null, e.message]);
+  const ok = async () => new Response('{}', { status: 200 });
+  const to = (location) => async () => new Response(null, { status: 302, headers: { location } });
+  assert.deepEqual(await reason(getter(ok)('http://example.org/x.json')), ['url', 'http://example.org/x.json is not read: only https on a public host name']);
+  assert.deepEqual(await reason(getter(to('http://example.org/y.json'))('https://example.org/x.json')), ['redirect', 'https://example.org/x.json: redirects to http://example.org/y.json, not followed (only to https on a public host name, at most 5 times)']);
+  assert.deepEqual(await reason(getter(dns('192.168.0.1'))('https://example.org/x.json')), ['address', 'https://example.org/x.json is not read: example.org resolves to 192.168.0.1, not a public address']);
+  // A host that does not answer: not refused, and the time in seconds (not a DOMException code).
+  assert.deepEqual(await reason(getter(dns(null), 50)('https://example.org/x.json')), [null, 'https://example.org/x.json could not be read (timed out after 0.05 s)']);
+  // Without a time limit given, the default one.
+  assert.deepEqual(await getter(ok)('https://example.org/x.json'), {});
+  // `under`: every redirect stays under the prefix (or one of the prefixes); without it, any public https place.
+  const hop = async (url) => (url === 'https://example.org/schema/a.json' ? new Response(null, { status: 302, headers: { location: 'https://other.example/a.json' } }) : ok());
+  const get = getter(hop);
+  assert.deepEqual(await reason(get('https://example.org/schema/a.json', { under: 'https://example.org/schema/' })), ['redirect', 'https://example.org/schema/a.json: redirects to https://other.example/a.json, not followed (only under https://example.org/schema/)']);
+  assert.deepEqual(await reason(get('https://example.org/schema/a.json', { under: ['https://example.org/schema/', 'https://w3id.org/x/schema/'] })), ['redirect', 'https://example.org/schema/a.json: redirects to https://other.example/a.json, not followed (only under https://example.org/schema/, https://w3id.org/x/schema/)']);
+  assert.deepEqual(await get('https://example.org/schema/a.json', { under: ['https://example.org/schema/', 'https://other.example/'] }), {});
+  assert.deepEqual(await get('https://example.org/schema/a.json'), {});
+});
+
 test('check --offline reads no schema of another site for the adapters', async () => {
   const { checkNode } = await import('../src/build/index.mjs');
   const dir = await mkdtemp(join(tmpdir(), 'datamodels-adapters-'));
@@ -307,6 +437,24 @@ test('a $ref outside the schema/ of a known node is never fetched', async () => 
   assert.deepEqual(Object.keys(r.refs), [good]);
   assert.equal(r.problems.length, bad.length);
   assert.ok(r.problems.every((x) => / is not read: only the schemas of the nodes in node\.yaml are \(https:\/\/datamodels\.jp\/schema\/\)$/.test(x)));
+});
+
+test('a schema or $ref of another node that redirects out of its schema/ is not followed', async () => {
+  const { schemaPrefixes } = await import('../src/adapters/index.mjs');
+  const entry = siteCatalog.models.find((m) => m.type === 'EvacuationSite');
+  const away = (from, seen) => async (url, o) => { seen.push(String(url)); return url === from ? new Response(null, { status: 302, headers: { location: 'https://other.example/x.json' } }) : siteFetch(url, o); };
+  // export: the model's own schema.
+  let seen = [];
+  await assert.rejects(exportModel('disaster/EvacuationSite', ['csv'], { index: DJ_INDEX, fetch: away(entry.schemaUrl, seen) }), new RegExp(`redirects to https://other\\.example/x\\.json, not followed \\(only under ${DJ.replace(/[.]/g, '\\.')}/schema/\\)`));
+  assert.ok(!seen.includes('https://other.example/x.json'));
+  // readRefs: a $ref under a known node's schema/.
+  const good = `${DJ}/schema/common/JapaneseAddress/v1.0.0.json`;
+  const thing = { type: 'Thing', kind: 'entity', schema: { properties: { id: { type: 'string' }, type: { const: 'Thing' }, p: { $ref: good } } } };
+  seen = [];
+  const r = await readRefs([thing], { fetch: away(good, seen), trusted: schemaPrefixes([{ url: `${DJ}/` }]) });
+  assert.deepEqual(Object.keys(r.refs), []);
+  assert.deepEqual(r.problems, [`${good}: redirects to https://other.example/x.json, not followed (only under ${DJ}/schema/)`]);
+  assert.ok(!seen.includes('https://other.example/x.json'));
 });
 
 test('PostGIS: a list without duplicates is checked by a function the file creates first', async () => {

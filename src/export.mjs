@@ -6,21 +6,23 @@ import { join } from 'node:path';
 import { loadNode } from './build/node.mjs';
 import { catalogUrls } from './build/urls.mjs';
 import { ADAPTERS, getter, textsOfEntry, readRefs, localRefs, schemaPrefixes, normalUrl } from './adapters/index.mjs';
-
-const DEFAULT_INDEX = 'https://datamodels.jp/catalog.json';
+import { DEFAULT_INDEX, OWN_INDEX_TIMEOUT, indexForModel, triedFirst, usableEntry } from './discover.mjs';
 
 /** A model of another node, from its catalog.json, shaped as loadSubjects() shapes one. */
 export async function remoteModel(target, from, get) {
   const catalog = await get(from);
   if (!Array.isArray(catalog?.models)) throw new Error(`${from}: no models (is it a catalog.json?)`);
-  const entry = /^https?:\/\//.test(target) ? catalog.models.find((m) => m.typeIri === target) : catalog.models.find((m) => `${m.subject}/${m.type}` === target);
+  const matches = catalog.models.filter((m) => (/^https?:\/\//.test(target) ? m?.typeIri === target : `${m?.subject}/${m?.type}` === target));
+  const entry = matches.find(usableEntry) ?? matches[0];
   if (!entry) throw new Error(`${target} is not a model in ${from}${/^https?:/.test(target) ? '' : ' (give <subject>/<Type> as listed there, or its type IRI)'}`);
   if (!entry.schemaUrl) throw new Error(`${from}: ${target} has no schemaUrl`);
   // Only a schema of that catalog's own site, as for the $refs (src/adapters/index.mjs).
   const schemaRoot = new URL('schema/', new URL('.', from)).href;
   const schemaUrl = normalUrl(entry.schemaUrl);
   if (!schemaUrl?.startsWith(schemaRoot)) throw new Error(`${from}: the schema of ${target} (${entry.schemaUrl}) is not under ${schemaRoot}, not read`);
-  const schema = await get(schemaUrl);
+  // Its type and version go into file names and the files: only plain ones.
+  if (!usableEntry(entry)) throw new Error(`${from}: ${target} has no usable type name (UpperCamelCase) and version (x.y.z)`);
+  const schema = await get(schemaUrl, { under: schemaRoot });
   // The catalog's languages, in the order its titles give them (datamodels.jp: ja, en).
   const languages = Object.keys(entry.title ?? {}).length ? Object.keys(entry.title) : ['en'];
   const subject = { name: entry.subject, version: entry.version };
@@ -38,10 +40,11 @@ export async function remoteModel(target, from, get) {
  * The files of the adapters `names` for one entity model: { files: [{ adapter, name, content }], from, typeIri }.
  * `target`: <subject>/<Type>, or a type IRI for a model of another node.
  * The model is this node's when `dir` is a node that has it and no `index` is
- * given; otherwise it is read from `index` (default: the first node in
- * node.yaml, else datamodels.jp).
+ * given; otherwise it is read from `index` (default: for a type IRI the index
+ * of the node that minted it, when that index lists it; else the first node in
+ * node.yaml, else datamodels.jp). `guessTimeout`: how long that first read may take.
  */
-export async function exportModel(target, names, { dir = '.', index, fetch: fetchUrl = globalThis.fetch, timeout = 20000 } = {}) {
+export async function exportModel(target, names, { dir = '.', index, fetch: fetchUrl = globalThis.fetch, timeout = 20000, guessTimeout = OWN_INDEX_TIMEOUT } = {}) {
   const adapters = names.map((n) => {
     const a = ADAPTERS.find((x) => x.name === n);
     if (!a) throw new Error(`no adapter ${n} (has: ${ADAPTERS.map((x) => x.name).join(', ')})`);
@@ -61,8 +64,14 @@ export async function exportModel(target, names, { dir = '.', index, fetch: fetc
     context = { urls: local.urls, languages: local.node.languages, refs };
     from = dir;
   } else {
-    from = index ?? local?.node.nodes?.[0]?.index ?? DEFAULT_INDEX;
-    const r = await remoteModel(target, from, getter(fetchUrl, timeout));
+    const fallback = index ?? local?.node.nodes?.[0]?.index ?? DEFAULT_INDEX;
+    // A type IRI without --index: the index of the node that minted it first.
+    const pick = byIri && !index ? await indexForModel(target, fallback, { fetch: fetchUrl, timeout, cap: guessTimeout, accepts: usableEntry, what: 'a model with a type name, version and schema' }) : { from: fallback, tried: null };
+    from = pick.from;
+    // The index read there is not read again.
+    const read = getter(fetchUrl, timeout);
+    const get = (url, options) => (pick.catalog && url === from ? Promise.resolve(pick.catalog) : read(url, options));
+    const r = await remoteModel(target, from, get).catch((e) => { throw triedFirst(e, pick.tried); });
     ({ subject, model } = r);
     const { refs, problems } = await readRefs([model], { entries: r.entries, fetch: fetchUrl, timeout, trusted: schemaPrefixes(r.nodes) });
     if (problems.length) throw new Error(problems.join('\n'));

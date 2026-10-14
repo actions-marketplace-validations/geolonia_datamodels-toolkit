@@ -8,12 +8,55 @@
 // adapters' getter: https only, a public host name, checked again on every
 // redirect and when connecting (src/adapters/net.mjs). A node that cannot be
 // read is a note, never a failure, except the index the search starts at.
+//
+// Also where export and extend look for a model given by its type IRI: the
+// index of the node that minted the IRI, before the usual one (indexForModel).
 import { getter, normalUrl } from './adapters/index.mjs';
+import { indexForIri } from './build/urls.mjs';
 
 export const DEFAULT_INDEX = 'https://datamodels.jp/catalog.json';
+
 // Limits, so a long chain of links or a large network cannot keep the command busy.
 export const MAX_DEPTH = 5;
 export const MAX_NODES = 50;
+
+// The read of a type IRI's own index is a guess, so it waits less than the other reads:
+// a host that does not answer holds up the usual index for at most this long (redirects included).
+export const OWN_INDEX_TIMEOUT = 5000;
+
+// What a catalog entry must have before its type and version are used in file
+// names, YAML and messages: an UpperCamelCase type name and an x.y.z version.
+export const TYPE_NAME = /^[A-Z][A-Za-z0-9]*$/;
+export const VERSION = /^\d+\.\d+\.\d+$/;
+/** Whether a catalog entry has a usable type name, version and schema URL. */
+export const usableEntry = (m) => typeof m?.type === 'string' && TYPE_NAME.test(m.type) && typeof m.version === 'string' && VERSION.test(m.version) && typeof m.schemaUrl === 'string';
+
+/**
+ * Where to look for a model given by its type IRI, when no index is given
+ * (geolonia/datamodels#222): first the index of the node that minted the IRI
+ * (indexForIri), then `fallback`, the index the command used before. The
+ * IRI's own index is read once, through the adapters' getter (https on a
+ * public host name only), within `cap` (OWN_INDEX_TIMEOUT), and used when it lists a
+ * model with that type IRI (an alias included) that `accepts` takes; `what`
+ * says what `accepts` wants, for the message.
+ * Returns { from, catalog } when it is used, else { from: fallback, tried },
+ * with `tried` saying why it was not used (null when nothing was read: the IRI
+ * has no index of its own, or it is the fallback itself).
+ */
+export async function indexForModel(iri, fallback, { fetch: fetchUrl = globalThis.fetch, timeout = OWN_INDEX_TIMEOUT, cap = OWN_INDEX_TIMEOUT, accepts = () => true, what = 'a model' } = {}) {
+  const own = indexForIri(iri);
+  if (!own || own === normalUrl(fallback)) return { from: fallback, tried: null };
+  let catalog;
+  try { catalog = await getter(fetchUrl, Math.min(timeout, cap))(own); } catch (e) { return { from: fallback, tried: e.message }; }
+  if (!Array.isArray(catalog?.models)) return { from: fallback, tried: `${own}: no models (is it a catalog.json?)` };
+  const listed = catalog.models.filter((m) => m?.typeIri === iri);
+  if (!listed.length) return { from: fallback, tried: `${own} does not list it` };
+  if (!listed.some(accepts)) return { from: fallback, tried: `${own} lists it, but not as ${what}` };
+  return { from: own, catalog };
+}
+
+/** An error of the lookup in the fallback index, with why the IRI's own index was not used. */
+export const triedFirst = (e, tried) => (tried ? new Error(`${e.message} (tried first: ${tried})`) : e);
 
 /**
  * The index URL for what is given: a catalog.json, or the address of a node
