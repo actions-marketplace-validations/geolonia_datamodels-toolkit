@@ -124,10 +124,17 @@ export function nodeFiles({ node, subject }, { licenseFile } = {}) {
   const namespace = node.iris === 'hash' ? `${node.baseUrl}/ns/${subject}#` : `${node.baseUrl}/ns/${subject}/`;
   const perLanguage = (text) => Object.fromEntries(node.languages.map((l) => [l, text]));
   const yaml = (o) => YAML.stringify(o, { lineWidth: 0 });
+  // Left for the user to fill in, each language: empty texts, so check refuses them until they are filled in.
+  // Without a title, the pages and llms.txt name the site after the publisher.
+  const textsHint = `{ ${node.languages.map((l) => `${l}: ""`).join(', ')} }`;
   return [
     { path: 'node.yaml', content: `# The settings of this data model node (https://github.com/geolonia/datamodels/blob/main/docs/node.md).
 # The base URL and the IRI form are part of every IRI the node publishes: do not change them once published.
-${yaml(node)}` },
+${yaml(node)}# Optional: the node's name and what it publishes. Fill in each language before you uncomment them.
+# The title names the site on every page and in catalog.json; the home page shows the description.
+# title: ${textsHint}
+# description: ${textsHint}
+` },
     { path: `models/${subject}/subject.yaml`, content: `# A subject: models that share one @context and one vocabulary. Write the title and description in each language.
 ${yaml({ name: subject, version: '0.1.0', source: 'minted', title: perLanguage(subject), description: perLanguage(`The models of ${subject}.`) })}` },
     { path: `models/${subject}/context.jsonld`, content: `${JSON.stringify({ '@context': { [subject]: namespace } }, null, 2)}\n` },
