@@ -13,8 +13,8 @@ import { catalogUrls, loadSubjects, buildNode, nodeAdapters } from '../src/build
 import { ADAPTERS, localRefs, readRefs } from '../src/adapters/index.mjs';
 import { columnsOf, shortTitle, snake } from '../src/adapters/model.mjs';
 import { fieldsOf, tableSchemaOf, xsdPattern } from '../src/adapters/table-schema/index.mjs';
-import { csvHeader } from '../src/adapters/csv/index.mjs';
-import { structuredOutputOf, unionCount, NotStrict, strict } from '../src/adapters/ai/index.mjs';
+import { csvHeader, csvField } from '../src/adapters/csv/index.mjs';
+import { structuredOutputOf, unionCount, NotStrict, strict, MAX_STRICT_PARTS } from '../src/adapters/ai/index.mjs';
 import { createTable, ident, literal } from '../src/adapters/postgis/index.mjs';
 import { exportModel } from '../src/export.mjs';
 
@@ -584,4 +584,44 @@ test('nodeAdapters (public): each bound adapter keeps its name, label and note',
     assert.equal(typeof a.urlFor, 'function');
     assert.equal(typeof a.content, 'function');
   }
+});
+
+test('csvField: plain names as they are; quotes, commas, line breaks and formula starts encoded', () => {
+  for (const name of ['id', 'name', 'addressLocality', 'location.lon', '名称']) assert.equal(csvField(name), name);
+  assert.equal(csvField('a,b'), '"a,b"');
+  assert.equal(csvField('say "hi"'), '"say ""hi"""');
+  assert.equal(csvField('two\nlines'), '"two\nlines"');
+  assert.equal(csvField('=HYPERLINK("https://evil.example","x")'), `"'=HYPERLINK(""https://evil.example"",""x"")"`);
+  for (const lead of ['+', '-', '@', '\t']) assert.equal(csvField(`${lead}1`), `'${lead}1`);
+  assert.equal(csvField('\r1'), `"'\r1"`);
+  // A line feed first: some spreadsheets read the next line as its own cell.
+  assert.equal(csvField('\n=1+1'), `"'\n=1+1"`);
+});
+
+test('strict: unions whose siblings multiply at each level stop with NotStrict, not exponential work', () => {
+  // Each level is an anyOf of two branches next to a sibling that holds the next level: 2^30 parts without a limit.
+  let s = { type: 'string' };
+  for (let i = 0; i < 30; i++) s = { anyOf: [{ type: 'object' }, { type: 'object' }], properties: { next: s }, additionalProperties: false, required: ['next'] };
+  const start = performance.now();
+  assert.throws(() => strict(s, 'x'), (e) => e instanceof NotStrict && e.message.includes(`more than ${MAX_STRICT_PARTS} parts`));
+  assert.ok(performance.now() - start < 2000);
+  // An ordinary schema still has its strict form.
+  assert.deepEqual(strict({ type: 'string' }, 'y').type, 'string');
+});
+
+test('publicFetch responses carry the raw bytes, so bytesReader compares published files byte for byte', async () => {
+  const { responseOf } = await import('../src/adapters/net.mjs');
+  const { bytesReader } = await import('../src/adapters/index.mjs');
+  // Not valid UTF-8, and a BOM: a decode and re-encode would change both.
+  const bytes = Buffer.from([0xef, 0xbb, 0xbf, 0x7b, 0x7d, 0xff, 0x0a]);
+  const res = responseOf(200, { 'content-type': 'application/json' }, bytes);
+  assert.deepEqual(Object.keys(res).sort(), ['arrayBuffer', 'headers', 'json', 'ok', 'status']);
+  assert.ok(Buffer.from(await res.arrayBuffer()).equals(bytes));
+  // bytesReader with a fetch shaped exactly like publicFetch (the shape that broke before).
+  const read = bytesReader(async () => responseOf(200, {}, bytes));
+  const r = await read('https://models.example.org/context/road/v0.1.0.jsonld');
+  assert.equal(r.ok, true);
+  assert.ok(r.body.equals(bytes));
+  const missing = await bytesReader(async () => responseOf(404, {}, Buffer.from('not found')))('https://models.example.org/x');
+  assert.deepEqual([missing.status, missing.ok, missing.body], [404, false, null]);
 });

@@ -269,6 +269,35 @@ test('--github in a repository without a remote: only on main, and only with no 
   assert.ok(f.calls.includes(`gh repo create example/models --public --source ${dir} --remote origin --push`));
 });
 
+test('--github in a repository with earlier commits: refused when they hold other files, history included', async () => {
+  const { dir, files } = await newNode();
+  await mkdir(join(dir, '.git'));
+  const clean = { 'git branch --show-current': 'main\n', 'git status --porcelain=v1 -z --untracked-files=all': '' };
+  // secrets.env was committed and deleted again: git status is clean, but the push would publish it.
+  let f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node.yaml\0secrets.env\0\0README.md\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /earlier commits hold other files that would be published with the node, history included: secrets\.env/);
+  assert.ok(!f.calls.some((c) => c.startsWith('gh repo create')), 'nothing created');
+  // Only the files of init in the history (an earlier run that stopped before the push): published.
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `${files.join('\0')}\0` } });
+  await publishToGitHub(dir, 'example/models', { ...f, files });
+  assert.ok(f.calls.includes(`gh repo create example/models --public --source ${dir} --remote origin --push`));
+  // No commits yet (git log prints nothing): published as before.
+  f = fakeRun({ answers: clean });
+  await publishToGitHub(dir, 'example/models', { ...f, files });
+  assert.ok(f.calls.includes(`gh repo create example/models --public --source ${dir} --remote origin --push`));
+  // Paths end with NUL: a file name with a line break is one path, not two.
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node.yaml\0README.md\nsecrets.env\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /history included: README\.md\nsecrets\.env/);
+  // A leading line break is part of the name: "\nnode.yaml" is not the node.yaml init writes.
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node.yaml\0\nnode.yaml\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /history included: \nnode\.yaml/);
+  // A git log that fails stops, rather than passing as an empty history; so does an ignored folder that was committed.
+  f = fakeRun({ answers: clean, fail: ['git log'] });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /git log .* failed/);
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node_modules/x/index.js\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /history included: node_modules\/x\/index\.js/);
+});
+
 test('--github with a remote: only the repository the remote points to, Pages switched to Actions', async () => {
   const { dir, files } = await newNode();
   await mkdir(join(dir, '.git'));
