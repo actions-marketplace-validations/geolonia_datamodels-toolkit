@@ -14,8 +14,8 @@ import { npxSpec } from './version.mjs';
 // the commit SHA of a release tag, with the tag as a comment, so Dependabot
 // can propose newer releases. A release updates both (it cannot point to
 // itself: the tag is made after the release commit).
-export const ACTION_REF = '94410330437df12524d0f3ef3dbd5b106d391300';
-export const ACTION_VERSION = 'v0.3.16';
+export const ACTION_REF = 'd4537b8cfbdcd02123eb8092c90b220266308a42';
+export const ACTION_VERSION = 'v0.3.19';
 const CHECKOUT = 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1';
 const GITIGNORE = ['_site/', 'node_modules/'];
 const SUBJECT_NAME = /^[a-z][a-z0-9-]*$/;
@@ -317,6 +317,17 @@ export async function publishToGitHub(dir, repo, { run, files = [] }) {
       if (branch !== 'main') throw new Error(`the workflow publishes the branch main, but this repository is on ${branch || 'no branch'}; switch to main first (git branch -m main)`);
       const other = statusPaths(await run('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: dir })).filter((p) => !ours.has(p));
       if (other.length) throw new Error(`other changes in the folder would be published with the node: ${other.slice(0, 5).join(', ')}${other.length > 5 ? ', …' : ''}. Commit or remove them first`);
+      // git status shows changes only: files committed before, and their history, would be pushed to a
+      // public repository too. Every file in the history must be one init writes (a run of init that
+      // stopped before the push left only those).
+      // A repository without commits prints nothing; a git log that fails stops here rather than passing as empty.
+      // .gitignore does not matter here: what was committed is pushed.
+      // -m lists merges against each parent too, so a file added while resolving a conflict is seen;
+      // -z ends each path with NUL and adds no other framing, so every byte between two NULs is the path,
+      // line breaks included (a file named "\nnode.yaml" is not node.yaml).
+      const history = await run('git', ['log', '--all', '-m', '--name-only', '--format=', '-z'], { cwd: dir });
+      const committed = [...new Set(history.split('\0').filter(Boolean))].filter((p) => !ours.has(p));
+      if (committed.length) throw new Error(`earlier commits hold other files that would be published with the node, history included: ${committed.slice(0, 5).join(', ')}${committed.length > 5 ? ', …' : ''}. Run init in a new folder, or make the repository yourself`);
     } else {
       const all = (await readdir(dir, { recursive: true, withFileTypes: true })).filter((e) => e.isFile()).map((e) => relative(dir, join(e.parentPath, e.name)).split(sep).join('/'));
       const other = all.filter((p) => !ours.has(p) && !ignored(p));

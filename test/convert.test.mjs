@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { decodeCsv, parseCsv, code6, convertRows, mappingProblems, mappedColumns, unknownFields, exponentForm, weekdays, time, TRANSFORMS, LINE } from '../src/convert.mjs';
+import { decodeCsv, parseCsv, code6, convertRows, mappingProblems, mappedColumns, unknownFields, exponentForm, weekdays, time, TRANSFORMS, LINE, visible, MAX_VIA_EXPANSIONS } from '../src/convert.mjs';
 import { siteReader, loadTarget } from '../src/catalog.mjs';
 
 const reader = siteReader(join(import.meta.dirname, 'fixtures', 'site'));
@@ -582,4 +582,35 @@ test('0:00–0:00 that a via mapping and the mapping around it make together is 
   const outer = { fields: { inner: { via: 'inner' } } };
   const two = convertRows([{ n: '1', o: '0:00', c: '0:00' }], plain('open'), { type: 'T', mappings: { hours: outer, inner: { convert: { allDay: 'closed' }, ...both } } })[0];
   assert.deepEqual([two.problems, two.entity.h, allDayFixes(two)], [[], { inner: { opens: '00:00', closes: '23:59' } }, [['opens', '00:00–00:00 → 00:00–23:59']]]);
+});
+
+test('parseCsv finds repeated headers in one pass, also with many columns', () => {
+  assert.throws(() => parseCsv('a,b,a,c,b\n1,2,3,4,5\n'), /header names must be present and distinct \(repeated: a, b\)/);
+  const many = Array.from({ length: 200_000 }, (_, i) => `c${i}`).join(',');
+  const start = performance.now();
+  assert.equal(parseCsv(`${many}\n`).columns.length, 200_000);
+  assert.ok(performance.now() - start < 2000, 'the header check must not be quadratic');
+});
+
+test('visible: input text cannot add lines or terminal escapes to the report', () => {
+  assert.equal(visible('plain 名称 text\twith tab'), 'plain 名称 text\twith tab');
+  assert.equal(visible('a\nline 2: 0 problems'), 'a\\nline 2: 0 problems');
+  assert.equal(visible('\u001b[2K\u001b[1Ahidden'), '\\u001b[2K\\u001b[1Ahidden');
+  assert.equal(visible('cr\rback'), 'cr\\u000dback');
+  assert.equal(visible('ls sep'), 'ls\\u2028sep');
+});
+
+test('convertRows stops a via graph that doubles at each level, and says so', () => {
+  // m0 refers to m1 twice, m1 to m2 twice, ...: 2^25 expansions without a limit.
+  const mappings = {};
+  for (let i = 0; i < 25; i++) mappings[`m${i}`] = { fields: { a: { via: `m${i + 1}` }, b: { via: `m${i + 1}` } } };
+  mappings.m25 = { fields: { name: { column: 'n' } } };
+  const start = performance.now();
+  const [r] = convertRows([{ n: 'x' }], { convert: { id: 'urn:x:{n}' }, fields: { top: { via: 'm0' } } }, { type: 'X', mappings });
+  assert.ok(performance.now() - start < 2000, 'the expansion must stop early');
+  assert.equal(r.problems.filter((p) => p.includes(`more than ${MAX_VIA_EXPANSIONS} via references`)).length, 1, JSON.stringify(r.problems));
+});
+
+test('parseCsv shows repeated header names as visible text', () => {
+  assert.throws(() => parseCsv('a\u001b[2K,a\u001b[2K\n1,2\n'), (e) => e.message.includes('(repeated: a\\u001b[2K)') && !e.message.includes('\u001b'));
 });

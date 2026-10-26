@@ -46,12 +46,12 @@ test('init writes a node that passes check and builds', async () => {
   assert.match(workflow, /uses: actions\/checkout@[0-9a-f]{40} # v/);
   // Pinned to a release: a commit SHA with the tag as a comment, as Dependabot expects.
   // The release this version of the toolkit writes: change both lines together with src/init.mjs.
-  assert.ok(workflow.includes('uses: geolonia/datamodels-toolkit@94410330437df12524d0f3ef3dbd5b106d391300 # v0.3.16\n'));
+  assert.ok(workflow.includes('uses: geolonia/datamodels-toolkit@d4537b8cfbdcd02123eb8092c90b220266308a42 # v0.3.19\n'));
   assert.match(workflow, /pages: write\n {6}id-token: write/);
   // The commands in the README run the same release as the workflow.
   const readme = await readFile(join(dir, 'README.md'), 'utf8');
-  assert.ok(readme.includes('npx @geolonia/datamodels@0.3.16 check\n'));
-  assert.ok(readme.includes('npx @geolonia/datamodels@0.3.16 build   # into _site/\n'));
+  assert.ok(readme.includes('npx @geolonia/datamodels@0.3.19 check\n'));
+  assert.ok(readme.includes('npx @geolonia/datamodels@0.3.19 build   # into _site/\n'));
   assert.doesNotMatch(readme, /datamodels-toolkit (check|build)/);
   // The licence: its legal code as LICENSE, named in the README.
   assert.ok((await readFile(join(dir, 'LICENSE'), 'utf8')).startsWith('Creative Commons Legal Code\n\nCC0 1.0 Universal\n'));
@@ -267,6 +267,35 @@ test('--github in a repository without a remote: only on main, and only with no 
   f = fakeRun({ answers: { 'git branch --show-current': 'main\n', 'git status --porcelain=v1 -z --untracked-files=all': `?? node.yaml\0` } });
   await publishToGitHub(dir, 'example/models', { ...f, files });
   assert.ok(f.calls.includes(`gh repo create example/models --public --source ${dir} --remote origin --push`));
+});
+
+test('--github in a repository with earlier commits: refused when they hold other files, history included', async () => {
+  const { dir, files } = await newNode();
+  await mkdir(join(dir, '.git'));
+  const clean = { 'git branch --show-current': 'main\n', 'git status --porcelain=v1 -z --untracked-files=all': '' };
+  // secrets.env was committed and deleted again: git status is clean, but the push would publish it.
+  let f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node.yaml\0secrets.env\0\0README.md\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /earlier commits hold other files that would be published with the node, history included: secrets\.env/);
+  assert.ok(!f.calls.some((c) => c.startsWith('gh repo create')), 'nothing created');
+  // Only the files of init in the history (an earlier run that stopped before the push): published.
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `${files.join('\0')}\0` } });
+  await publishToGitHub(dir, 'example/models', { ...f, files });
+  assert.ok(f.calls.includes(`gh repo create example/models --public --source ${dir} --remote origin --push`));
+  // No commits yet (git log prints nothing): published as before.
+  f = fakeRun({ answers: clean });
+  await publishToGitHub(dir, 'example/models', { ...f, files });
+  assert.ok(f.calls.includes(`gh repo create example/models --public --source ${dir} --remote origin --push`));
+  // Paths end with NUL: a file name with a line break is one path, not two.
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node.yaml\0README.md\nsecrets.env\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /history included: README\.md\nsecrets\.env/);
+  // A leading line break is part of the name: "\nnode.yaml" is not the node.yaml init writes.
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node.yaml\0\nnode.yaml\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /history included: \nnode\.yaml/);
+  // A git log that fails stops, rather than passing as an empty history; so does an ignored folder that was committed.
+  f = fakeRun({ answers: clean, fail: ['git log'] });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /git log .* failed/);
+  f = fakeRun({ answers: { ...clean, 'git log --all -m --name-only --format= -z': `node_modules/x/index.js\0` } });
+  await assert.rejects(publishToGitHub(dir, 'example/models', { ...f, files }), /history included: node_modules\/x\/index\.js/);
 });
 
 test('--github with a remote: only the repository the remote points to, Pages switched to Actions', async () => {

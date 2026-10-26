@@ -66,8 +66,10 @@ export function parseCsv(text) {
   const [head, ...body] = rows.filter((r) => !blank(r));
   if (!head) throw new Error('no header row');
   const names = head.fields.map((h) => h.trim());
-  const repeated = names.filter((h, i) => names.indexOf(h) !== i);
-  if (names.some((h) => !h) || repeated.length) throw new Error(`line ${head.line}: header names must be present and distinct${repeated.length ? ` (repeated: ${[...new Set(repeated)].join(', ')})` : ''}`);
+  // One pass: indexOf inside filter was quadratic in the number of columns.
+  const seen = new Set();
+  const repeated = names.filter((h) => seen.has(h) || !seen.add(h));
+  if (names.some((h) => !h) || repeated.length) throw new Error(`line ${head.line}: header names must be present and distinct${repeated.length ? ` (repeated: ${[...new Set(repeated)].map(visible).join(', ')})` : ''}`);
   const n = names.length;
   const bad = body.filter((r) => r.fields.length < n || r.fields.slice(n).some((v) => v.trim() !== ''));
   if (bad.length) throw new Error(`${bad.slice(0, 5).map((r) => `line ${r.line}: ${r.fields.length} fields`).join(', ')}${bad.length > 5 ? ` and ${bad.length - 5} more` : ''} (the header has ${n})`);
@@ -448,7 +450,12 @@ const valueAt = (obj, path) => path.split('.').reduce((v, k) => (v && typeof v =
  * one row gets are problems of those rows.
  * Returns one { entity, fixes, problems } per row; a fix is { field, repair, detail }.
  */
+/** How many via references one row may expand. A mapping that refers to the same mapping twice at each level grows exponentially without it. */
+export const MAX_VIA_EXPANSIONS = 1000;
+
 export function convertRows(rows, mapping, { type, mappings = {}, set = {} } = {}) {
+  // Via references expanded for the current row, against MAX_VIA_EXPANSIONS.
+  let expansions = 0;
   // chain: the via names being built, so a cycle is reported instead of recursing forever.
   // allDay: what 0:00–0:00 means (convert.allDay); the outermost mapping that says it wins, so
   // a mapping of your own decides it also for the catalog mappings it reaches through via.
@@ -461,6 +468,10 @@ export function convertRows(rows, mapping, { type, mappings = {}, set = {} } = {
         const sub = mappings[rule.via];
         if (!sub) { problems.push(`${field}: no mapping ${rule.via}`); continue; }
         if (chain.includes(rule.via)) { problems.push(`${field}: via cycle ${[...chain, rule.via].join(' → ')}`); continue; }
+        if (++expansions > MAX_VIA_EXPANSIONS) {
+          if (expansions === MAX_VIA_EXPANSIONS + 1) problems.push(`${field}: the mapping expands more than ${MAX_VIA_EXPANSIONS} via references for one row; a mapping that refers to the same mapping several times at each level grows too fast`);
+          continue;
+        }
         const word = allDay ?? sub.convert?.allDay;
         const { value: v, zones: inner } = build(sub, row, fixes, problems, false, [...chain, rule.via], word);
         const meaningful = (x) => Object.keys(x).some((k) => sub.fields[k]?.value === undefined);
@@ -506,6 +517,7 @@ export function convertRows(rows, mapping, { type, mappings = {}, set = {} } = {
   const rawOf = (row, k) => sourceColumns(k).map((c) => row[c]);
   const results = rows.map((row) => {
     const fixes = [], problems = [];
+    expansions = 0;
     const { value, zones } = build(mapping, row, fixes, problems, true);
     const { id: own, ...attrs } = sameHours(value, '', '', mapping.convert?.allDay, fixes, problems, zones);
     const all = { id: own, ...attrs };
@@ -548,4 +560,13 @@ export function convertRows(rows, mapping, { type, mappings = {}, set = {} } = {
     }
   }
   return results;
+}
+
+/**
+ * Text from the input (CSV cells and headers) as one visible line for the
+ * terminal: line breaks and other control characters, ANSI escapes included,
+ * are shown as \n or \u001b instead of acting on the output.
+ */
+export function visible(text) {
+  return String(text).replace(/[\u0000-\u0008\u000a-\u001f\u007f-\u009f\u2028\u2029]/g, (c) => (c === '\n' ? '\\n' : `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`));
 }

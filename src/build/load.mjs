@@ -1,11 +1,14 @@
 // Load a models folder: <subject>/{subject.yaml, context.jsonld, <Type>/...}.
 // Moved from geolonia/datamodels (scripts/lib/models.mjs, loadSubjects), with
 // the folder, the base URL and the required languages as options (#10).
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, readdir, stat, lstat, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { join, relative } from 'node:path';
 import YAML from 'yaml';
 
 const SEMVER = /^\d+\.\d+\.\d+$/;
+/** Keys loadSubjects() sets on a subject from the folder; subject.yaml may not hold them. */
+const RESERVED_SUBJECT_KEYS = ['dir', 'context', 'imports', 'inlineTerms', 'models'];
 
 // A file that does not parse is named in the error, from the models folder on (task/Task/examples/example.json: ...).
 const reader = (parse) => async (file, base) => {
@@ -19,6 +22,44 @@ async function isDir(p) { try { return (await stat(p)).isDirectory(); } catch { 
 async function exists(p) { try { await stat(p); return true; } catch { return false; } }
 
 /**
+ * Write a file of the node without following a symbolic link at its path, so
+ * a link put there after the checks below (by another process) is not written
+ * through. `create`: the file must not exist yet. O_NOFOLLOW is POSIX; where
+ * it does not exist (Windows), the earlier checks are the only guard.
+ */
+export async function writeNoFollow(file, content, { create = false } = {}) {
+  const { O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_NOFOLLOW = 0 } = constants;
+  try {
+    await writeFile(file, content, { flag: O_WRONLY | O_CREAT | (create ? O_EXCL : O_TRUNC) | O_NOFOLLOW });
+  } catch (e) {
+    if (e.code === 'ELOOP' || (create && e.code === 'EEXIST' && (await lstat(file)).isSymbolicLink())) throw new Error(`${file} is a symbolic link, not written`, { cause: e });
+    throw e;
+  }
+}
+
+/**
+ * Refuse symbolic links in a models folder. Mapping files and release
+ * snapshots are published byte for byte, so a link would publish whatever it
+ * points to, a file outside the node included, and release would write
+ * through one. A node has no use for links, so none is allowed anywhere in it.
+ * Walked by hand: readdir's recursive option descends into linked folders.
+ */
+export async function refuseLinks(modelsDir) {
+  if ((await lstat(modelsDir)).isSymbolicLink()) throw new Error(`${modelsDir} is a symbolic link. A node's models folder must hold real files and folders`);
+  const links = [];
+  const walk = async (dir) => {
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isSymbolicLink()) links.push(relative(modelsDir, p));
+      else if (e.isDirectory()) await walk(p);
+    }
+  };
+  await walk(modelsDir);
+  links.sort();
+  if (links.length) throw new Error(`${links.length === 1 ? 'a symbolic link' : `${links.length} symbolic links`} in ${modelsDir}: ${links.slice(0, 5).join(', ')}${links.length > 5 ? ', …' : ''}. Files there are published as they are, so the folder must hold real files and folders: replace each link with the file or folder it points to, or remove it`);
+}
+
+/**
  * The subjects of a models folder, each with its models.
  *
  * Options:
@@ -30,6 +71,7 @@ async function exists(p) { try { await stat(p); return true; } catch { return fa
 export async function loadSubjects(modelsDir, { urls, languages = ['ja', 'en'], subjectFields = ['title', 'summary', 'description'], importable = () => false } = {}) {
   const readJson = (file) => parseJson(file, modelsDir);
   const readYaml = (file) => parseYaml(file, modelsDir);
+  await refuseLinks(modelsDir);
   const subjects = [];
   for (const name of (await readdir(modelsDir)).sort()) {
     const dir = join(modelsDir, name);
@@ -37,6 +79,9 @@ export async function loadSubjects(modelsDir, { urls, languages = ['ja', 'en'], 
     // An empty subject.yaml (or one with only comments) is null: its missing name is reported below.
     const meta = (await readYaml(join(dir, 'subject.yaml'))) ?? {};
     if (meta.name !== name) throw new Error(`${name}/subject.yaml: name "${meta.name}" does not match folder`);
+    // The loader sets these itself; subject.yaml must not replace them (a dir there would move release, bump and publish elsewhere).
+    const reserved = RESERVED_SUBJECT_KEYS.filter((k) => Object.hasOwn(meta, k));
+    if (reserved.length) throw new Error(`${name}/subject.yaml: ${reserved.join(', ')} ${reserved.length === 1 ? 'is' : 'are'} set by the toolkit, not in subject.yaml`);
     if (!SEMVER.test(meta.version)) throw new Error(`${name}/subject.yaml: version must be X.Y.Z`);
     for (const field of subjectFields) {
       for (const lang of languages) {

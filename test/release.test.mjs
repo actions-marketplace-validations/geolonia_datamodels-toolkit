@@ -2,12 +2,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, stat, rm, rename, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { releaseSubject } from '../src/release.mjs';
-import { buildNode, checkNode } from '../src/build/index.mjs';
+import { writeNoFollow } from '../src/build/load.mjs';
+import { buildNode, checkNode, loadNode, snapshotRelease } from '../src/build/index.mjs';
 
 const run = promisify(execFile);
 const BIN = join(import.meta.dirname, '..', 'bin', 'datamodels.mjs');
@@ -111,4 +112,118 @@ test('datamodels release: exit codes', async () => {
   r = await datamodels('release');
   assert.equal(r.code, 2);
   assert.match(r.stderr, /missing arguments\nusage: datamodels release <subject> \[dir\] \[--offline\]/);
+});
+
+test('a symbolic link anywhere in models/ is refused, not published or written through', async (t) => {
+  const outside = await mkdtemp(join(tmpdir(), 'datamodels-release-secret-'));
+  const secret = join(outside, 'secret.txt');
+  await writeFile(secret, 'token: not for the site\n');
+  // Some systems (Windows without developer mode) cannot make links: nothing to test there.
+  try { await symlink(secret, join(outside, 'probe')); } catch { return t.skip('no symbolic links here'); }
+  // A released v0.1.0 and a current v0.2.0: the old snapshot is published as it is.
+  const released = async () => {
+    const dir = await node();
+    await releaseSubject(dir, 'road', { offline: true });
+    const subject = join(dir, 'models', 'road', 'subject.yaml');
+    await writeFile(subject, (await readFile(subject, 'utf8')).replace('version: 0.1.0', 'version: 0.2.0'));
+    return dir;
+  };
+  const refused = async (dir, name) => {
+    const out = join(dir, '_site');
+    await assert.rejects(buildNode(dir, { out, pages: false }), new RegExp(`symbolic links? in .*models: .*${name}.*replace each link`), name);
+    assert.equal(await exists(out), false, `${name}: nothing built`);
+    const r = await datamodels('check', dir);
+    assert.equal(r.code, 1, name);
+    assert.match(r.stderr + r.stdout, /symbolic link/, name);
+  };
+  const rel = (dir) => join(dir, 'models', 'road', 'releases', 'v0.1.0');
+  // A file of an old snapshot.
+  let dir = await released();
+  await rm(join(rel(dir), 'schema', 'RoadPatrol.json'));
+  await symlink(secret, join(rel(dir), 'schema', 'RoadPatrol.json'));
+  await refused(dir, 'RoadPatrol\\.json');
+  // A whole version folder.
+  dir = await released();
+  await rename(rel(dir), join(dir, 'elsewhere'));
+  await symlink(join(dir, 'elsewhere'), rel(dir));
+  await refused(dir, 'v0\\.1\\.0');
+  // A mapping file, which build also publishes as it is.
+  dir = await node();
+  await mkdir(join(dir, 'models', 'road', 'RoadPatrol', 'mapping'), { recursive: true });
+  await symlink(secret, join(dir, 'models', 'road', 'RoadPatrol', 'mapping', 'leak.yaml'));
+  await refused(dir, 'leak\\.yaml');
+  // A subject folder that points outside models/.
+  dir = await node();
+  await rename(join(dir, 'models', 'road'), join(dir, 'road-elsewhere'));
+  await symlink(join(dir, 'road-elsewhere'), join(dir, 'models', 'road'));
+  await refused(dir, 'road');
+  // release does not write through a dangling link.
+  dir = await node();
+  await mkdir(rel(dir), { recursive: true });
+  const target = join(outside, 'written-by-release.jsonld');
+  await symlink(target, join(rel(dir), 'context.jsonld'));
+  await assert.rejects(releaseSubject(dir, 'road', { offline: true }), /symbolic link/);
+  assert.equal(await exists(target), false);
+  // Nor does snapshotRelease, called directly as the library allows (without loadSubjects).
+  dir = await node();
+  const { subjects, urls, node: settings } = await loadNode(dir);
+  await mkdir(rel(dir), { recursive: true });
+  await symlink(target, join(rel(dir), 'context.jsonld'));
+  await assert.rejects(snapshotRelease(subjects[0], { urls, languages: settings.languages }), /context\.jsonld is a symbolic link/);
+  assert.equal(await exists(target), false);
+  // add does not write into a subject folder that is a link.
+  dir = await node();
+  await rename(join(dir, 'models', 'road'), join(dir, 'road-elsewhere'));
+  await symlink(join(dir, 'road-elsewhere'), join(dir, 'models', 'road'));
+  const r = await datamodels('add', 'road/RoadSign', dir);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /symbolic link/);
+  assert.equal(await exists(join(dir, 'road-elsewhere', 'RoadSign')), false);
+  // A link put at a path after the checks (by another process) is not written through either.
+  const late = join(outside, 'late');
+  await symlink(target, late);
+  await assert.rejects(writeNoFollow(late, 'x'), /late is a symbolic link, not written/);
+  await assert.rejects(writeNoFollow(late, 'x', { create: true }), /late is a symbolic link, not written/);
+  assert.equal(await exists(target), false);
+  await writeNoFollow(join(outside, 'plain.txt'), 'ok', { create: true });
+  await assert.rejects(writeNoFollow(join(outside, 'plain.txt'), 'again', { create: true }), { code: 'EEXIST' });
+  assert.equal(await readFile(join(outside, 'plain.txt'), 'utf8'), 'ok');
+  await rm(outside, { recursive: true, force: true });
+});
+
+test('subject.yaml cannot replace the folder the toolkit loads it from (or its other own keys)', async () => {
+  const dir = await node();
+  const subject = join(dir, 'models', 'road', 'subject.yaml');
+  const elsewhere = await mkdtemp(join(tmpdir(), 'datamodels-elsewhere-'));
+  await writeFile(subject, `${await readFile(subject, 'utf8')}dir: ${elsewhere}\n`);
+  await assert.rejects(buildNode(dir, { out: join(dir, '_site'), pages: false }), /road\/subject\.yaml: dir is set by the toolkit, not in subject\.yaml/);
+  await assert.rejects(releaseSubject(dir, 'road', { offline: true }), /dir is set by the toolkit/);
+  assert.deepEqual(await readdir(elsewhere), []);
+  await writeFile(subject, `${(await readFile(subject, 'utf8')).replace(/^dir: .*\n/m, '')}models: []\ncontext: {}\n`);
+  await assert.rejects(buildNode(dir, { out: join(dir, '_site'), pages: false }), /context, models are set by the toolkit/);
+});
+
+test('release and check do not follow a redirect of the published site to a private address', async () => {
+  const dir = await node();
+  const seen = [];
+  // The site answers every URL with a redirect to the cloud metadata address.
+  const redirecting = async (url, init) => {
+    seen.push(url);
+    assert.equal(init?.redirect, 'manual');
+    return new Response(null, { status: 302, headers: { location: 'http://169.254.169.254/latest/meta-data/' } });
+  };
+  await assert.rejects(releaseSubject(dir, 'road', { fetch: redirecting }), /redirects to http:\/\/169\.254\.169\.254\/latest\/meta-data\/, not followed/);
+  assert.ok(seen.every((u) => u.startsWith(BASE)), seen.join(' '));
+  const r = await checkNode(dir, { fetch: redirecting });
+  assert.ok(r.notes.some((n) => /redirects to http:\/\/169\.254\.169\.254.*not followed.*not compared/.test(n)), r.notes.join('\n'));
+  assert.ok(seen.every((u) => !u.includes('169.254')));
+});
+
+test('a baseUrl that is not https on a public host name is not read for the comparison', async () => {
+  const dir = await node();
+  await writeFile(join(dir, 'node.yaml'), (await readFile(join(dir, 'node.yaml'), 'utf8')).replace(`baseUrl: ${BASE}`, 'baseUrl: http://127.0.0.1:8080'));
+  const seen = [];
+  const r = await checkNode(dir, { fetch: async (url) => { seen.push(url); return new Response('x'); } });
+  assert.deepEqual(seen, []);
+  assert.ok(r.notes.some((n) => /is not read: only https on a public host name.*not compared/.test(n)), r.notes.join('\n'));
 });

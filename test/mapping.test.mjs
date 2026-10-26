@@ -409,3 +409,24 @@ test('a catalog rule with values and no transform stays a values lookup; for a b
   assert.deepEqual(m.fields.restrictedAccess, { column: '外部', values: { 外部利用不可: 'yes' } });
   assert.deepEqual(mappingProblems({ fields: m.fields }), []);
 });
+
+test('a CSV header with a line break stays inside its comment in the starter mapping', async () => {
+  const model = await siteModel(reader, 'disaster/EvacuationSite');
+  const evil = 'note\nconvert:\n  id: "urn:x:{note}"\r\n# end';
+  const r = startMapping({ target: 'disaster/EvacuationSite', ...model, header: ['名称', evil], csv: 'a.csv' });
+  assert.ok(r.unused.includes(evil));
+  const parsed = YAML.parse(r.text);
+  // The header text is only in a comment: no convert key from it, and every line it touches starts with #.
+  assert.notEqual(parsed.convert?.id, 'urn:x:{note}');
+  assert.ok(r.text.includes('# ') && r.text.includes('note convert:   id: "urn:x:{note}" # end'), r.text);
+});
+
+test('datamodels mapping shows a header with a line break or an escape code as visible text', async () => {
+  const csv = join(dir, 'escape.csv');
+  await writeFile(csv, '名称,"x\u001b[2K\nfake: 0 TODO(s)"\nA,1\n');
+  const r = await datamodels('mapping', 'facility/AEDLocation', csv, '--site', SITE_DIR);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /columns no row reads: x\\u001b\[2K\\nfake: 0 TODO\(s\)/);
+  assert.doesNotMatch(r.stderr, /\u001b/);
+  assert.equal(r.stderr.split('\n').filter((l) => l.startsWith('fake')).length, 0);
+});
