@@ -13,6 +13,7 @@
 //   nodes:                                           # optional: other nodes this node knows
 //     - { url: https://datamodels.jp/, index: https://datamodels.jp/catalog.json }
 //   prerelease: true                                 # optional: published versions may still be corrected (check --base)
+//   adapters: [geonicdb]                             # optional: product adapters to turn on (the generic ones always are)
 import { readFile, writeFile, mkdir, stat, rm, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import YAML from 'yaml';
@@ -22,7 +23,8 @@ import { publishCatalog } from './publish.mjs';
 import { llmsTxt } from './llms.mjs';
 import { writePages } from './pages.mjs';
 import { headersFile, redirectsFile, redirectsNote } from './hosts.mjs';
-import { ADAPTERS, readRefs, localRefs, refsRead, schemaPrefixes } from '../adapters/index.mjs';
+import { ADAPTERS, PRODUCT_ADAPTERS, readRefs, localRefs, refsRead, schemaPrefixes, getter } from '../adapters/index.mjs';
+import { needsTerms } from '../adapters/geonicdb/custom-data-model.mjs';
 
 // Every URL here is published: one with a user name or password in it would publish them too.
 export const httpUrl = (s) => { if (typeof s !== 'string') return false; try { const u = new URL(s); return ['http:', 'https:'].includes(u.protocol) && !!u.hostname && !u.username && !u.password; } catch { return false; } };
@@ -51,7 +53,8 @@ const NODE_TEXTS = ['title', 'description'];
 export function settingsProblems(node) {
   if (!node || typeof node !== 'object' || Array.isArray(node)) return ['must be a mapping of settings'];
   const problems = [];
-  const { baseUrl, iris = 'hash', languages = ['en'], publisher, license, licenseUrl, nodes, prerelease } = node;
+  const { baseUrl, iris = 'hash', languages = ['en'], publisher, license, licenseUrl, nodes, prerelease, adapters } = node;
+  if (adapters !== undefined && (!Array.isArray(adapters) || !adapters.every((a) => PRODUCT_ADAPTERS.some((p) => p.name === a)))) problems.push(`adapters must be a list of product adapters to turn on (${PRODUCT_ADAPTERS.map((p) => p.name).join(', ')}); the generic ones are always on`);
   if (!httpUrl(baseUrl) || new URL(baseUrl).search || new URL(baseUrl).hash) problems.push('baseUrl must be an http(s) URL without credentials, query or fragment');
   if (!['hash', 'slash'].includes(iris)) problems.push('iris must be hash or slash');
   if (!Array.isArray(languages) || !languages.length || !languages.every((l) => typeof l === 'string' && LANGUAGE_TAG.test(l))) problems.push('languages must be a list of language tags, for example [en] or [ja, en]');
@@ -77,8 +80,8 @@ export async function readNode(dir) {
   if (!node || typeof node !== 'object' || Array.isArray(node)) throw new Error(`${file}: must be a mapping of settings`);
   const problems = settingsProblems(node);
   if (problems.length) throw new Error(`${file}:\n${problems.map((p) => `  ${p}`).join('\n')}`);
-  const { baseUrl, iris = 'hash', languages = ['en'], title, description, publisher, license, licenseUrl, nodes, prerelease } = node;
-  return { baseUrl: baseUrl.replace(/\/+$/, ''), iris, languages, ...(title ? { title } : {}), ...(description ? { description } : {}), publisher, license, ...(licenseUrl ? { licenseUrl } : {}), ...(nodes?.length ? { nodes } : {}), ...(prerelease !== undefined ? { prerelease } : {}) };
+  const { baseUrl, iris = 'hash', languages = ['en'], title, description, publisher, license, licenseUrl, nodes, prerelease, adapters } = node;
+  return { baseUrl: baseUrl.replace(/\/+$/, ''), iris, languages, ...(title ? { title } : {}), ...(description ? { description } : {}), publisher, license, ...(licenseUrl ? { licenseUrl } : {}), ...(nodes?.length ? { nodes } : {}), ...(prerelease !== undefined ? { prerelease } : {}), ...(adapters?.length ? { adapters: [...new Set(adapters)] } : {}) };
 }
 
 /** The node in `dir`: its settings, URLs and subjects with their models, checked. Returns { node, urls, subjects }. */
@@ -112,18 +115,81 @@ export async function loadNode(dir) {
  * the node or online; a model whose schemas cannot be read gets no adapter
  * files, and `notes` says why.
  */
-export async function nodeAdapters(subjects, { urls, languages, fetch, timeout, offline = false, nodes = [] }) {
+export async function nodeAdapters(subjects, { urls, languages, fetch, timeout, offline = false, nodes = [], enabled = [] }) {
   const models = subjects.flatMap((s) => s.models.filter((m) => m.kind === 'entity'));
   // Schemas of other sites only from the nodes this node knows (node.yaml), as for @context imports.
   const { refs, problems } = await readRefs(models, { local: localRefs(subjects, urls), fetch, timeout, offline, trusted: schemaPrefixes(nodes) });
-  const context = { urls, languages, refs };
+  const products = PRODUCT_ADAPTERS.filter((p) => enabled.includes(p.name));
   const notes = problems.map((p) => `no adapter files for the models that use it: ${p}`);
-  const adapters = ADAPTERS.map((a) => ({
+  // The terms of the contexts, imports included, for the product adapters that expand terms (GeonicDB):
+  // only for the subjects with a model that needs them, so other builds read nothing more.
+  const withTerms = products.length ? subjects.filter((s) => s.models.some((m) => m.kind === 'entity' && needsTerms(m))) : [];
+  const terms = withTerms.length ? await subjectTerms(subjects, { urls, fetch, timeout, offline, only: withTerms.map((s) => s.name) }) : { terms: {}, problems: {} };
+  const context = { urls, languages, refs, terms: terms.terms, termsProblems: terms.problems, warn: (text) => notes.push(text) };
+  for (const [name, why] of Object.entries(terms.problems)) {
+    const affected = subjects.find((s) => s.name === name)?.models.filter((m) => m.kind === 'entity' && needsTerms(m)).map((m) => m.type) ?? [];
+    if (affected.length) notes.push(`no GeonicDB files for ${affected.map((t) => `${name}/${t}`).join(', ')}: the terms of the ${name} context are not known (${why})`);
+  }
+  const bind = (a) => ({
     name: a.name, label: a.label, note: a.note,
     urlFor: (subject, model) => (refsRead(model, refs) ? a.urlFor(subject, model, context) : null),
     content: (subject, model) => a.content(subject, model, context),
-  }));
-  return { adapters, notes };
+  });
+  // A product adapter is turned on by the node, not part of its models: a model it cannot convert
+  // (allowed terms that do not expand, its context's imports not read) gets no file and a note,
+  // instead of a wrong file or a failed build. Each body is made once.
+  const bindProduct = (a) => {
+    const made = new Map();
+    const make = (subject, model) => {
+      const key = `${subject.name}/${model.type}`;
+      if (!made.has(key)) {
+        let content = null;
+        if (model.kind === 'entity' && refsRead(model, refs) && (!needsTerms(model) || Object.hasOwn(terms.terms, subject.name))) {
+          try { content = a.content(subject, model, context); } catch (e) { notes.push(`no ${a.label.en} file for ${key}: ${e.message}`); }
+        }
+        made.set(key, content);
+      }
+      return made.get(key);
+    };
+    return {
+      name: a.name, label: a.label, note: a.note, product: true,
+      urlFor: (subject, model) => (make(subject, model) === null ? null : a.urlFor(subject, model, context)),
+      content: (subject, model) => make(subject, model),
+    };
+  };
+  return { adapters: [...ADAPTERS.map(bind), ...products.map(bindProduct)], notes };
+}
+
+/**
+ * The terms of each subject's @context, imports included, as a JSON-LD
+ * processor resolves them (resolveContext): { terms: { subject: { term: IRI } },
+ * problems: { subject: why } }. The contexts of `subjects` (current version, and
+ * the alias of its major version) come from their sources; any other import is
+ * read online, as `check` reads it: the imports a node's own contexts may make
+ * are limited to the nodes it knows (loadNode), and what those contexts import
+ * in turn is read only from public https hosts (getter). A subject whose context
+ * cannot be resolved for certain has no terms. `only`: the names of the subjects
+ * to resolve (default all); the others still serve as local contexts.
+ */
+export async function subjectTerms(subjects, { urls, fetch, timeout = 20000, offline = false, only }) {
+  const { resolveContext } = await import('./check.mjs');
+  const own = new Map();
+  for (const s of subjects) {
+    const su = urls.subjectUrls(s);
+    for (const url of [su.contextExact, su.contextAlias]) own.set(url, s.context);
+  }
+  const local = async (url) => own.get(url);
+  const getJson = getter(fetch, timeout);
+  const terms = {};
+  const problems = {};
+  for (const s of subjects.filter((x) => !only || only.includes(x.name))) {
+    try {
+      const resolved = await resolveContext(s.context['@context'], getJson, { offline, local, written: true });
+      if (resolved.open || resolved.uncertain.size) { problems[s.name] = resolved.notes.join('; ') || 'a context it imports was not read'; continue; }
+      terms[s.name] = Object.fromEntries([...resolved.iris].filter(([, iri]) => iri));
+    } catch (e) { problems[s.name] = e.message; }
+  }
+  return { terms, problems };
 }
 
 // Every page the toolkit writes says so: <meta name="generator" content="datamodels-toolkit <version>">.
@@ -165,7 +231,7 @@ export async function buildNode(dir, { out = join(dir, '_site'), now, pages: wit
   const head = { ...(node.title ? { title: node.title } : {}), ...(node.description ? { description: node.description } : {}), publisher: node.publisher, license: node.license, ...(node.licenseUrl ? { licenseUrl: node.licenseUrl } : {}), ...(node.nodes ? { nodes: node.nodes } : {}) };
   await mkdir(out, { recursive: true });
   await removeOldAdaptersPages(out);
-  const { adapters, notes } = await nodeAdapters(subjects, { urls, languages: node.languages, fetch, timeout, offline, nodes: node.nodes });
+  const { adapters, notes } = await nodeAdapters(subjects, { urls, languages: node.languages, fetch, timeout, offline, nodes: node.nodes, enabled: node.adapters ?? [] });
   const result = await publishCatalog(subjects, { urls, outDir: out, languages: node.languages, head, adapters, verify: verifyReleases, ...(now ? { now } : {}) });
   // English where a text has it, as in llms.txt; else the node's first language that does.
   const pickText = (o) => o?.en ?? node.languages.map((l) => o?.[l]).find(Boolean) ?? Object.values(o ?? {})[0];
