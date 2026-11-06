@@ -236,3 +236,12 @@ test('subjectTerms: a context that imports a sibling subject\'s reads it from th
   const alone = await subjectTerms([decisionLike], { urls, fetch: noNetwork });
   assert.match(alone.problems.decision, /common\/v1\.jsonld/);
 });
+
+test('the package exports the conversion with its options, for tenant variants', async () => {
+  const pkg = await import('@geolonia/datamodels/adapters');
+  assert.equal(pkg.toCustomDataModel, toCustomDataModel);
+  assert.equal(pkg.expandVocabTerm, expandVocabTerm);
+  const variant = pkg.toCustomDataModel(task, model('Task'), context, { typePrefix: 'Acme' });
+  assert.equal(variant.type, 'AcmeTask');
+  assert.deepEqual(variant.propertyDetails, body('Task').propertyDetails);
+});
