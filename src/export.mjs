@@ -3,9 +3,9 @@
 // datamodels.jp's), as convert and extend read them.
 import { writeFile, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { loadNode } from './build/node.mjs';
+import { loadNode, subjectTerms } from './build/node.mjs';
 import { catalogUrls } from './build/urls.mjs';
-import { ADAPTERS, getter, textsOfEntry, readRefs, localRefs, schemaPrefixes, normalUrl } from './adapters/index.mjs';
+import { ALL_ADAPTERS, getter, textsOfEntry, readRefs, localRefs, schemaPrefixes, normalUrl } from './adapters/index.mjs';
 import { DEFAULT_INDEX, OWN_INDEX_TIMEOUT, indexForModel, triedFirst, usableEntry } from './discover.mjs';
 
 /** A model of another node, from its catalog.json, shaped as loadSubjects() shapes one. */
@@ -46,8 +46,8 @@ export async function remoteModel(target, from, get) {
  */
 export async function exportModel(target, names, { dir = '.', index, fetch: fetchUrl = globalThis.fetch, timeout = 20000, guessTimeout = OWN_INDEX_TIMEOUT } = {}) {
   const adapters = names.map((n) => {
-    const a = ADAPTERS.find((x) => x.name === n);
-    if (!a) throw new Error(`no adapter ${n} (has: ${ADAPTERS.map((x) => x.name).join(', ')})`);
+    const a = ALL_ADAPTERS.find((x) => x.name === n);
+    if (!a) throw new Error(`no adapter ${n} (has: ${ALL_ADAPTERS.map((x) => x.name).join(', ')})`);
     return a;
   });
   let local = null;
@@ -62,6 +62,13 @@ export async function exportModel(target, names, { dir = '.', index, fetch: fetc
     const { refs, problems } = await readRefs([model], { local: localRefs(local.subjects, local.urls), fetch: fetchUrl, timeout, trusted: schemaPrefixes(local.node.nodes) });
     if (problems.length) throw new Error(problems.join('\n'));
     context = { urls: local.urls, languages: local.node.languages, refs };
+    // The terms of the subject's context, for the adapters that expand terms (GeonicDB).
+    if (adapters.some((a) => a.product)) {
+      // Every subject of the node: a context may import a sibling's (decision imports common), read from the sources.
+      const t = await subjectTerms(local.subjects, { urls: local.urls, fetch: fetchUrl, timeout, only: [subject.name] });
+      context.terms = t.terms;
+      context.termsProblems = t.problems;
+    }
     from = dir;
   } else {
     const fallback = index ?? local?.node.nodes?.[0]?.index ?? DEFAULT_INDEX;
@@ -76,6 +83,22 @@ export async function exportModel(target, names, { dir = '.', index, fetch: fetc
     const { refs, problems } = await readRefs([model], { entries: r.entries, fetch: fetchUrl, timeout, trusted: schemaPrefixes(r.nodes) });
     if (problems.length) throw new Error(problems.join('\n'));
     context = { urls: r.urls, languages: r.languages, refs };
+    // The terms of the model's context, read from its site (its contextUrl), for the adapters that expand terms.
+    // Only a context of that catalog's own site, as for its schema (remoteModel).
+    if (adapters.some((a) => a.product) && model.links?.contextUrl) {
+      const contextRoot = new URL('context/', new URL('.', from)).href;
+      const contextUrl = normalUrl(model.links.contextUrl);
+      const fail = (why) => { context.termsProblems = { [subject.name]: why }; };
+      if (!contextUrl?.startsWith(contextRoot)) fail(`its context ${model.links.contextUrl} is not under ${contextRoot}, not read`);
+      else {
+        const { resolveContext } = await import('./build/check.mjs');
+        try {
+          const resolved = await resolveContext(contextUrl, getter(fetchUrl, timeout));
+          if (!resolved.open && !resolved.uncertain.size) context.terms = { [subject.name]: Object.fromEntries([...resolved.iris].filter(([, iri]) => iri)) };
+          else fail(resolved.notes.join('; ') || 'a context it imports was not read');
+        } catch (e) { fail(e.message); }
+      }
+    }
   }
   if (model.kind !== 'entity') throw new Error(`${target} is a value type; the adapters write files for entity types`);
   const files = adapters.map((a) => {
